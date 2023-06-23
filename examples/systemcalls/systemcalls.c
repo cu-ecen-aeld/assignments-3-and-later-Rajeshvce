@@ -1,4 +1,14 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <stdio.h>
+#include <limits.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -16,8 +26,16 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
-
-    return true;
+    int rc;
+    rc = system(cmd);
+    if(rc < 0)
+    {
+        return false;
+    }
+    else
+    {
+        return true;
+    }
 }
 
 /**
@@ -40,14 +58,46 @@ bool do_exec(int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+    char resolvedPathCmd[PATH_MAX];
+
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
+        int cmdWithSpaces = 0;
+        const char *cmdStr = command[i];
+        while(*cmdStr)
+        {
+            if(*cmdStr == ' ')
+            {
+                cmdWithSpaces = 1;
+                break;
+            }
+            cmdStr++;
+        }
+        if(cmdWithSpaces)
+        {
+            /* Skip checking this argument */
+            continue;
+        }
+        if(command[i][0] == '-')
+        {
+            /* Skip checking this argument */
+            continue;
+        }
+        if(realpath(command[i], resolvedPathCmd) == NULL)
+        {
+            fprintf(stderr, "'%s' is not an absolute path\n", command[i]);
+            return false;
+        }
+        if(resolvedPathCmd[0] == '/')
+        {
+            printf("'%s' is an absolute path\n", command[i]);
+        }
     }
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    // command[count] = command[count];
 
 /*
  * TODO:
@@ -58,6 +108,33 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+
+    pid_t pid;
+    int status;
+
+    pid = fork();
+    if(pid == 0)
+    {
+        execv(command[0], command);
+        fprintf(stderr, "%s command error : '%d' (%s)\n", command[0], errno, strerror(errno));
+        return false;
+    }
+    if(pid == -1)
+    {
+        fprintf(stderr, "fork command error : '%d' (%s)\n", errno, strerror(errno));
+        return false;
+    }
+    if(pid > 0)
+    {
+        if(waitpid(pid, &status, 0) == -1)
+        {
+            return false;
+        }
+        else if(WIFEXITED(status))
+        {
+            printf("process pid = '%d'\n", pid);
+        }
+    }
 
     va_end(args);
 
@@ -75,14 +152,51 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+    char resolvedPathCmd[PATH_MAX];
+
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
+        int cmdWithSpaces = 0;
+        const char *cmdStr = command[i];
+        while(*cmdStr)
+        {
+            if(*cmdStr == ' ')
+            {
+                cmdWithSpaces = 1;
+                break;
+            }
+            cmdStr++;
+        }
+        if(cmdWithSpaces)
+        {
+            /* Skip checking this argument */
+            continue;
+        }
+        if(command[i][0] == '-')
+        {
+            /* Skip checking this argument */
+            continue;
+        }
+        if(realpath(command[i], resolvedPathCmd) == NULL)
+        {
+            fprintf(stderr, "'%s' is not an absolute path\n", command[i]);
+            return false;
+        }
+        if(resolvedPathCmd[0] == '/')
+        {
+            printf("'%s' is an absolute path\n", command[i]);
+        }
+        else
+        {
+            printf("'%s' is not an absolute path\n", command[i]);
+            return false;
+        }
     }
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    // command[count] = command[count];
 
 
 /*
@@ -92,6 +206,46 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+
+    pid_t pid;
+    int status;
+    int fd;
+
+    fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+    if(fd < 0)
+    {
+        fprintf(stderr, "Fail to open %s file : '%d' (%s)\n", outputfile, errno, strerror(errno));
+        return false;
+    }
+    pid = fork();
+    if(pid == 0)
+    {
+        if(dup2(fd, 1) < 0)
+        {
+            fprintf(stderr, "dup2 error : '%d' (%s)\n", errno, strerror(errno));
+            return false;
+        }
+        close(fd);
+        execv(command[0], command);
+        fprintf(stderr, "%s command error : '%d' (%s)\n", command[0], errno, strerror(errno));
+        return false;
+    }
+    if(pid == -1)
+    {
+        fprintf(stderr, "fork command error : '%d' (%s)\n", errno, strerror(errno));
+        return false;
+    }
+    if(pid > 0)
+    {
+        if(waitpid(pid, &status, 0) == -1)
+        {
+            return false;
+        }
+        else if(WIFEXITED(status))
+        {
+            printf("process pid = '%d'\n", pid);
+        }
+    }
 
     va_end(args);
 
