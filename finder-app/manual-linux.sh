@@ -1,6 +1,7 @@
 #!/bin/bash
 # Script outline to install and build kernel.
 # Author: Siddhant Jajoo.
+# Edited by F Fenlon 
 
 set -e
 set -u
@@ -8,6 +9,7 @@ set -u
 OUTDIR=/tmp/aeld
 KERNEL_REPO=git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
 KERNEL_VERSION=v5.1.10
+
 BUSYBOX_VERSION=1_33_1
 FINDER_APP_DIR=$(realpath $(dirname $0))
 ARCH=arm64
@@ -32,12 +34,25 @@ fi
 if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     cd linux-stable
     echo "Checking out version ${KERNEL_VERSION}"
-    git checkout ${KERNEL_VERSION}
+    git checkout ${KERNEL_VERSION} 
 
     # TODO: Add your kernel build steps here
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} mrproper 
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
+    make -j4 ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} all
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} dtbs
+    echo "Kernel build completed"
+
 fi
 
-echo "Adding the Image in outdir"
+#Check if image has been added to OUTDIR, add if not there
+if [ ! -e ${OUTDIR}/Image ]; then
+
+    echo "Adding the Image in outdir"
+    cp ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ${OUTDIR}/Image
+
+fi
+
 
 echo "Creating the staging directory for the root filesystem"
 cd "$OUTDIR"
@@ -47,7 +62,20 @@ then
     sudo rm  -rf ${OUTDIR}/rootfs
 fi
 
-# TODO: Create necessary base directories
+# TODO: Create necessary base directories 
+#[bin dev etc home lib lib64 proc sbin sys tmp usr var]
+if [ ! -d "${OUTDIR}/rootfs" ]
+then
+    cd "$OUTDIR"
+    mkdir rootfs
+fi
+
+cd "$OUTDIR"
+cd rootfs
+mkdir bin dev etc home lib lib64 proc sbin sys tmp usr var
+mkdir -p usr/bin usr/sbin usr/lib
+mkdir -p var/log
+mkdir -p home/conf
 
 cd "$OUTDIR"
 if [ ! -d "${OUTDIR}/busybox" ]
@@ -55,26 +83,70 @@ then
 git clone git://busybox.net/busybox.git
     cd busybox
     git checkout ${BUSYBOX_VERSION}
-    # TODO:  Configure busybox
+    
+    # TODO:  Configure busybox 
+    # CONFIRM IF DEFCONFIG IS GOOD ENOUGH OR  WE NEED THE MENU
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
+
 else
     cd busybox
 fi
 
 # TODO: Make and install busybox
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} 
+make CONFIG_PREFIX=${OUTDIR}/rootfs ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} install
 
+cd "$OUTDIR/rootfs"
 echo "Library dependencies"
 ${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
 ${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
 
 # TODO: Add library dependencies to rootfs
+# Add program interpreter to lib and add libraries to lib64
+export SYSROOT=$(${CROSS_COMPILE}gcc -print-sysroot)
+
+sudo	cp -aL "${SYSROOT}/lib/ld-linux-aarch64.so.1" "${OUTDIR}/rootfs/lib"
+sudo	cp -aL "${SYSROOT}/lib64/libm.so.6" "${OUTDIR}/rootfs/lib64"
+sudo	cp -aL "${SYSROOT}/lib64/libresolv.so.2" "${OUTDIR}/rootfs/lib64"
+sudo	cp -aL "${SYSROOT}/lib64/libc.so.6" "${OUTDIR}/rootfs/lib64"
+
+#cp -f -L ${CROSS_COMPILE_LIB}/libm.so.6 ${OUTDIR}/rootfs/lib64
+#cp -f -L ${CROSS_COMPILE_LIB}/libresolv.so.2 ${OUTDIR}/rootfs/lib64
+#cp -f -L ${CROSS_COMPILE_LIB}/libc.so.6 ${OUTDIR}/rootfs/lib64
 
 # TODO: Make device nodes
+cd "$OUTDIR/rootfs"
+sudo mknod -m 666 dev/null c 1 3
+sudo mknod -m 600 dev/console c 5 1
 
 # TODO: Clean and build the writer utility
+cd $FINDER_APP_DIR
+if [ -f "writer" ]
+    then 
+        rm writer
+        echo "Previous writer removed"
+    fi
+${CROSS_COMPILE}gcc writer.c -o writer
+echo "Writer executable created"
 
 # TODO: Copy the finder related scripts and executables to the /home directory
 # on the target rootfs
+cd "$FINDER_APP_DIR"
+#cp -R -L -v * ${OUTDIR}/rootfs/home
+cp -L -v autorun-qemu.sh ${OUTDIR}/rootfs/home
+cp -L -v finder-test.sh ${OUTDIR}/rootfs/home
+cp -L -v finder.sh ${OUTDIR}/rootfs/home
+cp -L -v writer ${OUTDIR}/rootfs/home
+cd conf
+cp -L -v * ${OUTDIR}/rootfs/home/conf
 
 # TODO: Chown the root directory
+cd "$OUTDIR/rootfs/"
+sudo chown -R root:root *
 
 # TODO: Create initramfs.cpio.gz
+cd "$OUTDIR/rootfs"
+find . | cpio -H newc -ov --owner root:root > ${OUTDIR}/initramfs.cpio
+cd "$OUTDIR"
+gzip -f initramfs.cpio
+echo "initramfs.cpio.gz created. Ready to go!"
