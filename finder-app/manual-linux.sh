@@ -12,6 +12,7 @@ KERNEL_VERSION=v5.1.10
 
 BUSYBOX_VERSION=1_33_1
 FINDER_APP_DIR=$(realpath $(dirname $0))
+KERNEL_PATCH=${FINDER_APP_DIR}/kernel-patch/
 ARCH=arm64
 CROSS_COMPILE=aarch64-none-linux-gnu-
 
@@ -34,7 +35,9 @@ fi
 if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     cd linux-stable
     echo "Checking out version ${KERNEL_VERSION}"
-    git checkout ${KERNEL_VERSION} 
+    git checkout ${KERNEL_VERSION}
+    #Kernel Patch due to yyloc
+    git apply ${KERNEL_PATCH}/dtc-multiple-definition.patch -v 
 
     # TODO: Add your kernel build steps here
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} mrproper 
