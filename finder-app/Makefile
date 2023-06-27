@@ -1,31 +1,11 @@
-CC := gcc
+CC=${CROSS_COMPILE}gcc
+all: writer.c
+	echo "using CC = ${CROSS_COMPILE}gcc to build"
+	$(CC) -o writer writer.c
 
-# Cross-compiler configuration
-CROSS_COMPILE?=
-SYSROOT :=
 
-ifeq ($(CROSS_COMPILE),aarch64-none-linux-gnu-)
-    CC := $(CROSS_COMPILE)$(CC)
-    SYSROOT := $(shell $(CC) -print-sysroot)
-endif
+gcc:
+	gcc -o writer writer.c
 
-# Compiler flags
-CFLAGS := -Wall -Wextra
-
-# Default target
-default: writer
-
-# Build the writer application
-writer: writer.o
-	$(CC) $(CFLAGS) -o $@ $^ $(SYSROOT)
-
-# Compile writer.c to writer.o
-writer.o: writer.c
-	$(CC) $(CFLAGS) -c $< -o $@ --sysroot=$(SYSROOT)
-
-# Clean target
 clean:
-	rm -f writer writer.o
-
-.PHONY: default clean
-
+	rm -rf writer
