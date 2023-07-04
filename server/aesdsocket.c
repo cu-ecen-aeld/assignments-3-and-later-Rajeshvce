@@ -1,663 +1,362 @@
-/*
- * @filename 		:	aesdsocket.c
- *
- * @author			: 	Tanmay Mahendra Kothale (tanmay-mk)
- *
- * @date 			:	Feb 19, 2022
- 						Updated on Feb 27, 2022
- 						Changes for Assignment 6 Part 1
- */
-/*------------------------------------------------------------------------*/
-/*								LIBRARY FILES							  */
-/*------------------------------------------------------------------------*/
-#include <stdio.h>
+#include "aesdsocket.h"
 #include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <syslog.h>
-#include <string.h>
-#include <unistd.h>
 #include <sys/socket.h>
-#include <netdb.h>
-#include <errno.h>
-#include <stdarg.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <signal.h>
-#include <stdbool.h>
+#include <errno.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdbool.h>
 #include <pthread.h>
-#include <sys/queue.h>
-#include <sys/time.h>
-/*------------------------------------------------------------------------*/
-/*								MACROS									  */
-/*------------------------------------------------------------------------*/
+#include <stdarg.h>
 
-#define STORAGE_PATH 		"/var/tmp/aesdsocketdata"
-#define PORT 				"9000"
-#define SOCKET_FAMILY 		AF_INET6
-#define SOCKET_TYPE			SOCK_STREAM
-#define SOCKET_FLAGS		AI_PASSIVE
+#include "freebsd_queue.h"
 
-//parameters for daemon
-#define NOCHDIR 			(0)
-#define NOCLOSE 			(0)
+#define LOG_FILE "/var/tmp/aesdsocketdata"
+#define PORT "9000"
+#define BUFFER_SIZE (1024)
 
-#define FILE_PERMISSIONS 	(0644)
-#define BUFFER_SIZE			(1024)
-#define LISTEN_BACKLOG		(5)
+#define DEBUG 0
 
-#define DEBUG				(0) 	//set this to 1 to enable printfs for debug
-#define ERROR				(-1)
-#define SUCCESS				(0)
-
-/*------------------------------------------------------------------------*/
-/*				GLOBAL STRUCTURES FOR THREAD & SOCKET HANDLING			  */
-/*------------------------------------------------------------------------*/
-typedef struct
+void FK_DEBUG(const char *fmt, ...)
 {
-	bool thread_complete;
-	pthread_t thread_id;
-	int clifd;
-	pthread_mutex_t *mutex;
-}thread_parameters;
 
-struct slist_data_s
-{
-	thread_parameters	thread_params;
-	SLIST_ENTRY(slist_data_s) entries;
-};
+  if (DEBUG) {
+    va_list args;
+    va_start(args, fmt);
+    printf(fmt, args);
+    va_end(args);
+  }
+}
+
+bool got_signal = false;
+int sockfd;
+
 
 typedef struct slist_data_s slist_data_t;
-pthread_mutex_t mutex_lock = PTHREAD_MUTEX_INITIALIZER;
+struct slist_data_s {
+  struct sockaddr_in client_ca;
+  int logfile;
+  pthread_mutex_t *log_mutex;
+  int c;
+  //pid_t pid;
+  pthread_t pid;
+  bool completed;
+
+  SLIST_ENTRY(slist_data_s) entries;
+};
+
+slist_data_t *datap=NULL;
 SLIST_HEAD(slisthead, slist_data_s) head;
 
-/*------------------------------------------------------------------------*/
-/*							GLOBAL VARIABLES							  */
-/*------------------------------------------------------------------------*/
-int 			fd 				= 0;		//file descriptor
-int 			sockfd 			= 0;		//socket file descriptor
-int 			clientfd 		= 0;		//client file descriptor
-int 			status 			= 0;		//variable for checking errors
-int 			packets 		= 0;		//size of packet received
-char 			byte 			= 0;		//variable for byte by byte transfer
-bool 			isdaemon		= false;	//boolean value to check for daemon
-slist_data_t 	*datap 			= NULL;		//node data pointer for linked list
+typedef struct timestamper_data_s timestamper_data_t;
+struct timestamper_data_s {
+  pthread_t pid;
+  int logfile;
+  pthread_mutex_t *log_mutex;
+};
 
-/*------------------------------------------------------------------------*/
-/* 							FUNCTION PROTOTYPES	 						  */
-/*------------------------------------------------------------------------*/
-/*
- * @brief		: 	handles the entire communication process using
- *					socket
- *
- * @parameters	:	none
- *
- * @returns		:	Does not return on success, returns -1 on error.
- */
-static void handle_socket();
-/*------------------------------------------------------------------------*/
-/*
- * @brief		: 	handles reading data from file and sending to client
- *					via sockets using threads
- *
- * @parameters	:	none
- *
- * @returns		:	pointer to thread parameters, exits with EXIT_FAILURE on 
- *					error
- */
-void* thread_handler(void* thread_params);
-/*------------------------------------------------------------------------*/
-/*
- * @brief		: 	handles the SIGALRM signal every time timer goes off
- *
- * @parameters	:	none
- *
- * @returns		:	none, exits with EXIT_FAILURE on error
- */
-static void sigalrm_handler();
-/*------------------------------------------------------------------------*/
-/*
- * @brief		: 	When a signal is caught during operation,
- * 					this function is called in response to
- *					the signal. Depending on the signal
- *					value, respective actons are taken.
- *
- * @parameters	:	signal_number	:	value of signal caught
- *
- * @returns		:	none
- */
-static void signal_handler(int signal_number);
 
-/*------------------------------------------------------------------------*/
-/*
- * @brief		:	Application entry point
- *					Calls handle_socket() and never exits. If handle_socket()
- *					returns with error, it performs cleanup and terminates
- *					the application with return value -1.
- */
-/*------------------------------------------------------------------------*/
+static void sigHandler(int sig)
+{
+  FK_DEBUG("SIGINT\n");
+  syslog(LOG_ERR, "Caught signal, exiting");
+  
+  // close sockets
+  shutdown(sockfd, SHUT_RD);
+  shutdown(sockfd, SHUT_WR);
+  close(sockfd);
+
+  unlink(LOG_FILE);
+  got_signal = true;
+  
+  // should free all data in linkedlist and stop all threads
+  while (!SLIST_EMPTY(&head)) {
+    datap = SLIST_FIRST(&head);
+    FK_DEBUG("Removing thread: %lu\n", datap->pid);
+    pthread_cancel(datap->pid);
+
+    SLIST_REMOVE_HEAD(&head, entries);
+    free(datap);
+  }
+  _exit(EXIT_FAILURE);
+    
+}
+
+void *timestamper(void *arg) {
+  timestamper_data_t *data = (timestamper_data_t *) arg;
+  struct timespec wanted_sleep;
+  struct timespec remaining_sleep;
+  int wanted_sleep_ms = 10 * 1000;
+  char timestring[100];
+  time_t t;
+  struct tm *tmp;
+
+  while(1){
+    wanted_sleep.tv_sec  = wanted_sleep_ms / 1000;
+    wanted_sleep.tv_nsec = (wanted_sleep_ms % 1000) * 1000000;
+    if (0 != nanosleep(&wanted_sleep, &remaining_sleep)){
+      // did not sleep enough
+    }
+    int res = pthread_mutex_lock(data->log_mutex);
+    FK_DEBUG("mutex_lock: %d\n", res);
+    
+    // should use some error handling here
+    t = time(NULL);
+    tmp = localtime(&t);
+    strftime(timestring, sizeof(timestring), "timestamp:%a, %d %b %Y %T %z\n", tmp);
+    write(data->logfile, timestring, strlen(timestring));
+    res = pthread_mutex_unlock(data->log_mutex);
+    FK_DEBUG("mutex_unlock: %d\n", res);
+  }
+}
+
+void *connection_thread(void *arg)
+{
+  slist_data_t *data = (slist_data_t *) arg;
+  char *client_ip = inet_ntoa(data->client_ca.sin_addr);
+  syslog(LOG_DAEMON, "Accepted connection from %s", client_ip);
+    
+  unsigned long totalbytes=0;
+  // read messages separated by \n until \0 is received
+  while (1) {
+    char *buffer = malloc(BUFFER_SIZE);
+    //if (NULL == buffer) goto ERR_BUFFER_ALLOCATION;
+    
+    // wait for data or 10second timeout
+    int bytes_read = recv(data->c, buffer, BUFFER_SIZE, 0);
+    if (bytes_read < 1){
+      FK_DEBUG("socket failure: %d\n", errno);
+      free(buffer);
+      return NULL;
+    }
+    totalbytes += bytes_read;
+    
+    // check if message contains \n
+    char *nn = strchr(buffer, '\n');
+    // if also end of all messages
+    FK_DEBUG("Got %d bytes\n", bytes_read);
+    
+    // get mutex here
+    int res = pthread_mutex_lock(data->log_mutex);
+    FK_DEBUG("mutex_lock: %d\n", res);
+
+    if (NULL != nn ) {
+      int to_write = (nn-buffer);
+      int written = write(data->logfile, buffer, to_write);
+      if (written < 0){
+        FK_DEBUG("\tfailed: %d\n", errno);
+      }
+      FK_DEBUG("\tComplete message len: %d wrote: %d\n", to_write, written);
+      //buffer[to_write] = '\0';
+      //FK_DEBUG("\tmessage '%s'\n", buffer);
+
+      buffer[0] = '\n';
+      written = write(data->logfile, buffer, 1);
+      free(buffer);
+      FK_DEBUG("unlocking mutex\n");
+      res=pthread_mutex_unlock(data->log_mutex);
+      FK_DEBUG("mutex_unlock: %d\n", res);
+
+      break;
+    } else {
+      FK_DEBUG("No complete message yet, (writing %d to log)\n", bytes_read);
+      write(data->logfile, buffer, bytes_read);
+      free(buffer);
+
+      FK_DEBUG("unlocking mutex\n");
+      res=pthread_mutex_unlock(data->log_mutex);
+      FK_DEBUG("mutex_unlock: %d\n", res);
+
+    }
+    //free(buffer);
+    // give mutex here
+    FK_DEBUG("unlocking mutex\n");
+    res=pthread_mutex_unlock(data->log_mutex);
+    FK_DEBUG("mutex_unlock: %d\n", res);
+
+  }
+
+  FK_DEBUG("Send data to socket\n");
+
+  // get mutex again
+  int res=pthread_mutex_lock(data->log_mutex);
+  FK_DEBUG("mutex_lock: %d\n", res);
+
+  // getting filesize
+  lseek(data->logfile, 0, SEEK_SET);
+  long filesize = lseek(data->logfile, 0, SEEK_END);
+  lseek(data->logfile, 0, SEEK_SET);
+  if (filesize < 0) return NULL; //goto ERR_NOTHING_TO_SEND; 
+
+  char *wrbuffer = (char*) malloc(BUFFER_SIZE);
+  if (NULL==wrbuffer) return NULL; //goto ERR_BUFFER_ALLOCATION;
+  size_t readbytes=0;
+  FK_DEBUG("Sending %ld bytes\n", filesize);
+  while(readbytes < filesize) {
+    
+    size_t this_read = read(data->logfile, wrbuffer, BUFFER_SIZE);
+    if (0==this_read){
+      // end of file
+      break;
+    }
+    FK_DEBUG("Sending %ld bytes total: %ld/%ld\n", this_read, readbytes+this_read, filesize);
+    send(data->c, (void *)wrbuffer, this_read, 0);
+    readbytes += this_read;
+  }
+  free(wrbuffer);
+  // give back mutex
+  res = pthread_mutex_unlock(data->log_mutex);
+  FK_DEBUG("mutex_unlock: %d\n", res);
+
+  close(data->c);
+  syslog(LOG_DAEMON, "Closed connection from %s", client_ip);
+  data->completed = true;
+  pthread_exit(NULL);
+}
+
+
 int main(int argc, char *argv[])
 {
-	openlog("aesdsocket",LOG_PID,LOG_USER);
+    openlog("AESDSOCKET", 0, LOG_USER);
+   
 
-	//configure signals
-	if(signal(SIGINT, signal_handler)==SIG_ERR)
-	{
-		syslog(LOG_ERR, "Failed to configure SIGINT handler\n");
-		#if DEBUG
-			printf("Failed to configure SIGINT handler\n");
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	if(signal(SIGTERM, signal_handler)==SIG_ERR)
-	{
-		syslog(LOG_ERR, "Failed to configure SIGTERM handler\n");
-		#if DEBUG
-			printf("Failed to configure SIGTERM handler\n");
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	if(signal(SIGALRM, sigalrm_handler)==SIG_ERR)
-	{
-		syslog(LOG_ERR, "Failed to configure SIGALRM handler\n");
-		#if DEBUG
-			printf("Failed to configure SIGALRM handler\n");
-		#endif
-		exit(EXIT_FAILURE);
-	}
+    // making socket to listen on
+    struct addrinfo hints;
+    struct addrinfo *servinfo;
 
-	pthread_mutex_init(&mutex_lock, NULL);
+    memset((void *)&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    
+    
+    FK_DEBUG("getaddrinfo\n");
+    if (0 != getaddrinfo(NULL, PORT, &hints, &servinfo) ) goto ERR_GETADDRINFO;
 
-	//check for daemon
-	if((argc >= 2) && (!strcmp("-d",(char*)argv[1])))
-	{
-		isdaemon = true;
-	}
+    FK_DEBUG("creating socket\n");
+    sockfd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
+    if (0 == sockfd) goto ERR_SOCKET;
+      
+    // Enable reuseaddr
+    int on = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
 
-	//This function should never return
-	//if it returns, an error has occured
-	handle_socket();
+    FK_DEBUG("binding socket\n");
+    int sock = bind(sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
+    if (0 != sock) goto ERR_BIND;
+     
+    freeaddrinfo(servinfo);
+    if (argc > 1) {
+      if (strncmp("-d", argv[1], 2) == 0) {
+        FK_DEBUG("start daemon\n");
+        
+        switch(fork()){
+          case -1: 
+            FK_DEBUG("Failed at forking\n");
+            return -1;
+          case 0:
+            // We should continue the app
+            break;
+          default:
+            _exit(EXIT_SUCCESS);
+        }
+      }
+    }
+    signal(SIGINT, sigHandler);
+    signal(SIGTERM, sigHandler);
+    FK_DEBUG("start listening\n");
+    if( listen(sockfd, 5) < 0 ) goto ERR_LISTEN;
+    
+    int f_log = open(LOG_FILE, O_CREAT | O_TRUNC |O_RDWR, 0644);
+    if (f_log < 0) {
+      syslog(LOG_ERR, "OPpenfile failed: %d", f_log);
+      goto ERR_FILE_ERROR;
+    }
+    // Create a mutex for file access
+    //static pthread_mutex_t m_logfile;
+    //pthread_mutex_init(&m_logfile, NULL);
+    static pthread_mutex_t m_logfile = PTHREAD_MUTEX_INITIALIZER;
 
-	//close log
-	closelog();
+    // create timestamper
+    timestamper_data_t t_data;
+    t_data.log_mutex = &m_logfile;
+    t_data.logfile = f_log;
+    pthread_create(&t_data.pid, NULL, &timestamper, (void*) &t_data);
+    
+    // Linked List for sockets
+    SLIST_INIT(&head);
+    while (1){
+      datap = malloc(sizeof(slist_data_t));
 
-	return ERROR;
+      int len_client_ca = sizeof(struct sockaddr_in);
+      if ( (datap->c = accept(sockfd, (struct sockaddr *) &datap->client_ca, (socklen_t *)&len_client_ca)) < 0) {
+        // failed accepting socket
+        FK_DEBUG("Timed out accepting: %d\n", errno);
+        
+        return 5;
+      }
+      datap->log_mutex = &m_logfile;
+      datap->logfile = f_log;//dup(f_log);
+      datap->completed = false;
+      // do the fork dance here
+      // update pid in data, and insert to linked lise
+      int rr = pthread_create(&datap->pid, NULL, &connection_thread, (void *) datap);
+      FK_DEBUG("rr: %d\n", rr);
+
+      SLIST_INSERT_HEAD(&head, datap, entries);
+
+      SLIST_FOREACH(datap, &head, entries) {
+        FK_DEBUG("Thread: %ld\n", (long unsigned int)datap->pid);
+
+        if (datap->completed) {
+          FK_DEBUG("Thread: %ld is complete\n", (long unsigned int)datap->pid);
+          void *ret = NULL;
+          pthread_join(datap->pid, &ret);
+          FK_DEBUG("Removing thread: %lu\n", datap->pid);
+          //SLIST_REMOVE(datap, entries);
+          SLIST_REMOVE(&head, datap, slist_data_s, entries);
+          free(datap);
+        }
+        
+      }
+    } // while(1)
+      
+    shutdown(sockfd, SHUT_RD);
+    shutdown(sockfd, SHUT_WR);
+    close(sockfd);
+    closelog();
+    return 0;
+      
+  ERR_GETADDRINFO:
+    syslog(LOG_ERR, "getaddrinfo failed");
+    goto RETURN_ERR;
+  ERR_SOCKET:
+    freeaddrinfo(servinfo);
+    syslog(LOG_ERR, "Error creating socket");
+    goto RETURN_ERR;
+  ERR_BIND:
+    freeaddrinfo(servinfo);
+    syslog(LOG_ERR, "Error binding to address");
+    goto RETURN_ERR;
+    
+  ERR_LISTEN:
+    close(sockfd);
+    syslog(LOG_ERR, "Error listening");
+    FK_DEBUG("Cold not listen\n");
+    goto RETURN_ERR;
+  
+  ERR_FILE_ERROR:
+    close(sockfd);
+    syslog(LOG_ERR, "Error opening file: %d", errno);
+    FK_DEBUG("Error opening file: %d\n", errno);
+    goto RETURN_ERR;
+    
+  RETURN_ERR:
+    closelog();
+    return -1;
+  
 }
-/*------------------------------------------------------------------------*/
-static void handle_socket()
-{
-	struct addrinfo hints;
-	struct addrinfo *results;
-	struct sockaddr client_addr;
-	socklen_t client_addr_size;
-	char ip_address[INET_ADDRSTRLEN];
-	struct sockaddr_in *address;
-	struct itimerval timer;
-	SLIST_INIT(&head);
-	/*------------------------------------------------------------------------*/
-	memset(&hints,0,sizeof(hints));
-	hints.ai_flags 		= SOCKET_FLAGS;
-	hints.ai_family 	= SOCKET_FAMILY;
-	hints.ai_socktype 	= SOCKET_TYPE;
-	status = getaddrinfo(NULL,PORT,&hints,&results);
-	if(status != SUCCESS)
-	{
-		syslog(LOG_ERR,"getaddrinfo() failed\n");
-		#if DEBUG
-			printf("getaddrinfo() failed\n");
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/ 
-	sockfd = socket(PF_INET6, SOCK_STREAM, 0);
-	if(sockfd == ERROR)
-	{
-		syslog(LOG_ERR,"socket() failed\n");
-		#if DEBUG
-			printf("socket() failed\n");
-		#endif
-		freeaddrinfo(results);
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/ 
-	status = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
-	if(status == ERROR)
-	{
-		syslog(LOG_ERR,"setsockopt() failed\n");
-		#if DEBUG
-			printf("setsockopt() failed\n");
-		#endif
-		freeaddrinfo(results);
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/ 
-	status = bind(sockfd, results->ai_addr, results->ai_addrlen);
-	if(status == ERROR)
-	{
-		syslog(LOG_ERR,"bind() failed\n");
-		#if DEBUG
-			printf("bind() failed\n");
-		#endif
-		freeaddrinfo(results);
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/ 
-	if (isdaemon)
-	{
-		//change the process' current working directory
-		//to root directory & redirect STDIN, STDOUT, 
-		//STDERR to /dev/null.
-		status = daemon(NOCHDIR,NOCLOSE);
-		if(status == ERROR)
-		{
-			syslog(LOG_ERR,"daemon() failed\n");
-			#if DEBUG
-				printf("daemon() failed\n");
-			#endif
-			exit(EXIT_FAILURE);
-		}
-		syslog(LOG_INFO,"Entering daemon mode\n");
-		#if DEBUG
-			printf("Entering daemon mode\n");
-		#endif
-	}
-	/*------------------------------------------------------------------------*/ 
-	fd = creat(STORAGE_PATH, FILE_PERMISSIONS);
-	if(fd == ERROR)
-	{
-		syslog(LOG_ERR,"creat() failed\n");
-		#if DEBUG
-			printf("creat() failed\n");
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	close(fd);
-	freeaddrinfo(results);
-	/*------------------------------------------------------------------------*/ 
-	//configure timer
-	timer.it_interval.tv_sec 	= 10; //timer interval of 10 secs
-	timer.it_interval.tv_usec 	= 0;
-	timer.it_value.tv_sec 		= 10; //time expiration of 10 secs
-	timer.it_value.tv_usec 		= 0;
-	status = setitimer(ITIMER_REAL, &timer, NULL);
-	if(status == ERROR)
-	{
-		syslog(LOG_ERR,"setitimer() failed\n");
-		#if DEBUG
-			printf("setitimer() failed\n");
-		#endif
-	}
-	/*------------------------------------------------------------------------*/
-	while(true)
-	{
-		status = listen(sockfd, LISTEN_BACKLOG);
-		if(status == ERROR)
-		{
-			syslog(LOG_ERR,"listen() failed\n");
-			#if DEBUG
-				printf("listen() failed\n");
-			#endif
-			freeaddrinfo(results);
-			exit(EXIT_FAILURE);
-		}
-		/*------------------------------------------------------------------------*/
-		client_addr_size = sizeof(struct sockaddr);
-		clientfd = accept(sockfd,(struct sockaddr *)&client_addr, &client_addr_size);
-		if(clientfd == ERROR)
-		{
-			syslog(LOG_ERR,"accept() failed\n");
-			#if DEBUG
-				printf("accept() failed\n");
-			#endif
-			freeaddrinfo(results);
-			exit(EXIT_FAILURE);
-		}
-		address = (struct sockaddr_in *)&client_addr;
-		inet_ntop(AF_INET, &(address->sin_addr),ip_address,INET_ADDRSTRLEN);
-		syslog(LOG_INFO,"Accepting connection from %s",ip_address);
-		#if DEBUG
-			printf("Accepting connection from %s",ip_address);
-		#endif
-		/*------------------------------------------------------------------------*/
-		datap = (slist_data_t *) malloc(sizeof(slist_data_t));
-		SLIST_INSERT_HEAD(&head,datap,entries);
-
-		datap->thread_params.clifd 				= clientfd;
-		datap->thread_params.thread_complete 	= false;
-		datap->thread_params.mutex 				= &mutex_lock;
-
-		status = pthread_create(&(datap->thread_params.thread_id), 			
-							NULL,			
-							thread_handler,			
-							&datap->thread_params
-							);
-
-		if (status != SUCCESS)
-		{
-			syslog(LOG_ERR,"pthread_create() failed\n");
-			#if DEBUG
-				printf("pthread_create() failed\n");
-			#endif
-			exit(EXIT_FAILURE);
-		}
-
-		syslog(LOG_INFO,"Thread created\n");
-		#if DEBUG
-			printf("Thread created\n");
-		#endif
-
-		SLIST_FOREACH(datap,&head,entries)
-		{
-			pthread_join(datap->thread_params.thread_id,NULL);
-			if(datap->thread_params.thread_complete == true)
-			{
-				//pthread_join(datap->thread_params.thread_id,NULL);
-				SLIST_REMOVE(&head, datap, slist_data_s, entries);
-				free(datap);
-				break;
-			}
-		}
-		syslog(LOG_INFO,"Thread exited\n");
-		#if DEBUG
-			printf("Thread exited\n");
-		#endif
-
-		syslog(LOG_DEBUG,"Closed connection from %s",ip_address);
-		#if DEBUG
-			printf("Closed connection from %s",ip_address);
-		#endif
-		/*------------------------------------------------------------------------*/
-	}
-	close(clientfd);
-	close(sockfd);
-}
-
-/*------------------------------------------------------------------------*/
-void* thread_handler(void* thread_params)
-{
-	bool packet_rcvd = false;
-	int i;
-	char read_data[BUFFER_SIZE] = {0};
-	char *buffer = NULL;
-	thread_parameters * parameters = (thread_parameters *) thread_params;
-	/*------------------------------------------------------------------------*/
-	buffer = (char *) malloc(sizeof(char)*BUFFER_SIZE);
-	if(buffer == NULL)
-	{
-		syslog(LOG_ERR,"malloc() failed");
-		#if DEBUG
-			printf("malloc() failed");
-		#endif
-		exit(EXIT_FAILURE);
-	}
-
-	memset(buffer,0,BUFFER_SIZE);
-	/*------------------------------------------------------------------------*/
-	while(!packet_rcvd)
-	{
-		status = recv(parameters->clifd, read_data, BUFFER_SIZE ,0); 
-		if(status == ERROR)
-		{
-			syslog(LOG_ERR,"recv() failed");
-			#if DEBUG
-				printf("recv() failed");
-			#endif
-			exit(EXIT_FAILURE);
-		}
-		/*------------------------------------------------------------------------*/
-		for(i = 0;i < BUFFER_SIZE;i++)
-		{
-			if(read_data[i] == '\n')
-			{
-				packet_rcvd = true;
-				i++;
-				break;
-			}
-		}
-		packets += i;
-		/*------------------------------------------------------------------------*/
-		buffer = (char *) realloc(buffer,(ssize_t)(packets+1));
-		if(buffer == NULL)
-		{
-			syslog(LOG_ERR,"realloc() failed");
-			#if DEBUG
-				printf("recv() failed");
-			#endif
-			exit(EXIT_FAILURE);
-		}
-		strncat(buffer,read_data,i);
-		memset(read_data,0,BUFFER_SIZE);
-	}
-	/*------------------------------------------------------------------------*/
-	status = pthread_mutex_lock(parameters->mutex);
-	if(status != SUCCESS)
-	{
-		syslog(LOG_ERR,"pthread_mutex_lock() failed with error code: %d\n",status);
-		#if DEBUG
-			printf("pthread_mutex_lock() failed with error code: %d\n",status);
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/
-	fd = open(STORAGE_PATH,O_APPEND | O_WRONLY);
-	if(fd == ERROR)
-	{
-		syslog(LOG_ERR,"open() failed (append and write only)\n");
-		#if DEBUG
-			printf("open() failed (append and write only)\n");
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/
-	int status = write(fd,buffer,strlen(buffer));
-	if(status == ERROR)
-	{
-		syslog(LOG_ERR,"write() failed\n");
-		#if DEBUG
-			printf("write() failed\n");
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	else if(status != strlen(buffer))
-	{
-		syslog(LOG_ERR,"File partially written\n");
-		#if DEBUG
-			printf("File partially written\n");
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	close(fd);
-	/*------------------------------------------------------------------------*/
-	memset(read_data,0,BUFFER_SIZE);
-	fd = open(STORAGE_PATH,O_RDONLY);
-	if(fd == ERROR)
-	{
-		syslog(LOG_ERR,"open() failed (read only)\n");
-		#if DEBUG
-			printf("open() failed (read only)\n");
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/
-	for(i=0;i<packets;i++)
-	{
-		status = read(fd, &byte, 1);
-		if(status == ERROR)
-		{
-			syslog(LOG_ERR,"read() failed!\n");
-			#if DEBUG
-				printf("read() failed!\n");
-			#endif
-			exit(EXIT_FAILURE);
-		}
-		/*------------------------------------------------------------------------*/
-		status = send(parameters->clifd,&byte,1,0);
-		if(status == ERROR)
-		{
-			syslog(LOG_ERR,"send() failed!\n");
-			#if DEBUG
-				printf("send() failed!\n");
-			#endif
-			exit(EXIT_FAILURE);
-		}
-	}
-	/*------------------------------------------------------------------------*/
-	status = pthread_mutex_unlock(parameters->mutex);
-	if(status!=SUCCESS)
-	{
-		syslog(LOG_ERR,"pthread_mutex_unlock() failed with error code: %d\n",status);
-		#if DEBUG
-			printf("pthread_mutex_unlock() failed with error code: %d\n",status);
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/
-	
-	parameters->thread_complete = true;
-
-	close(fd);
-	close(parameters->clifd);
-	free(buffer);
-
-	return parameters;
-}
-/*------------------------------------------------------------------------*/
-static void signal_handler(int signal_number)
-{
-	switch(signal_number)
-	{
-		case SIGINT:
-			syslog(LOG_DEBUG,"SIGINT Caught! Exiting ... \n");
-			#if DEBUG
-				printf("SIGINT Caught! Exiting ... \n");
-			#endif
-			
-			while(SLIST_FIRST(&head) != NULL)
-			{
-				SLIST_FOREACH(datap,&head,entries)
-				{
-					close(datap->thread_params.clifd);
-					pthread_join(datap->thread_params.thread_id,NULL);
-					SLIST_REMOVE(&head, datap, slist_data_s, entries);
-					free(datap);
-					break;
-				}
-			}
-
-			pthread_mutex_destroy(&mutex_lock);
-			unlink(STORAGE_PATH);
-			close(clientfd);
-			close(sockfd);
-			break;
-		/*------------------------------------------------------------------------*/
-		case SIGTERM:
-			syslog(LOG_INFO,"SIGTERM Caught! Exiting ... \n");
-			#if DEBUG
-				printf("SIGTERM Caught! Exiting ... \n");
-			#endif
-
-			while(SLIST_FIRST(&head) != NULL)
-			{
-				SLIST_FOREACH(datap,&head,entries)
-				{
-					close(datap->thread_params.clifd);
-					pthread_join(datap->thread_params.thread_id,NULL);
-					SLIST_REMOVE(&head, datap, slist_data_s, entries);
-					free(datap);
-					break;
-				}
-			}
-			pthread_mutex_destroy(&mutex_lock);
-			unlink(STORAGE_PATH);
-			close(clientfd);
-			close(sockfd);
-			break;
-		/*------------------------------------------------------------------------*/
-		default:
-			exit(EXIT_FAILURE);
-			break;
-	}
-	exit(EXIT_SUCCESS);
-}
-/*------------------------------------------------------------------------*/
-static void sigalrm_handler()
-{
-	char timestr[200];
-	time_t t;
-	struct tm *ptr;
-	int timer_length = 0;
-	/*------------------------------------------------------------------------*/
-	t = time(NULL);
-	ptr = localtime(&t);
-	if(ptr == NULL)
-	{
-		syslog(LOG_ERR,"localtime() failed\n");
-		#if DEBUG
-			printf("localtime() failed\n");				
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/
-
-	timer_length = strftime(timestr,sizeof(timestr),"timestamp:%d.%b.%y - %k:%M:%S\n",ptr);
-	if(timer_length == SUCCESS)
-	{
-		syslog(LOG_ERR,"strftime() failed\n");
-		#if DEBUG
-			printf("strftime() failed\n");				
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/
-	fd = open(STORAGE_PATH,O_APPEND | O_WRONLY);
-	if(fd == ERROR)
-	{
-		syslog(LOG_ERR,"open() failed (append and write only)\n");
-		#if DEBUG
-			printf("open() failed (append and write only)\n");				
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/
-	status = pthread_mutex_lock(&mutex_lock);
-	if(status != SUCCESS)
-	{
-		syslog(LOG_ERR,"pthread_mutex_lock() failed with error code %d\n", status);
-		#if DEBUG
-			printf("pthread_mutex_lock() failed with error code %d\n", status);				
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	/*------------------------------------------------------------------------*/
-	status = write(fd,timestr,timer_length);
-	if(status == ERROR)
-	{
-		syslog(LOG_ERR,"write() failed\n");
-		#if DEBUG
-			printf("write() failed\n");				
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	else if(status != timer_length)
-	{
-		syslog(LOG_ERR,"file partially written\n");
-		#if DEBUG
-			printf("file partially written\n");				
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	packets += timer_length;
-	/*------------------------------------------------------------------------*/
-	status = pthread_mutex_unlock(&mutex_lock);
-	if(status != SUCCESS)
-	{
-		syslog(LOG_ERR,"pthread_mutex_unlock() failed with error code %d\n", status);
-		#if DEBUG
-			printf("pthread_mutex_unlock() failed with error code %d\n", status);				
-		#endif
-		exit(EXIT_FAILURE);
-	}
-	close(fd);
-}
-/*EOF*/
-/*------------------------------------------------------------------------*/
