@@ -1,22 +1,11 @@
-#! /bin/sh
-set -e
+#!/bin/sh
 
-NAME=aesdsocket
-PIDFILE=/var/run/$NAME.pid
-DAEMON=/usr/bin/aesdsocket
-DAEMON_OPTS="-d"
+if [ "$1" == "start" ]
+then
+    start-stop-daemon -S --exec /usr/bin/aesdsocket -- -d
+fi
 
-case "$1" in
-    start)
-        echo "Starting simpleserver"
-        start-stop-daemon --start --quiet -n $NAME --exec $DAEMON -- $DAEMON_OPTS
-        ;;
-    stop)
-        echo "Stopping simpleserver"
-        start-stop-daemon --stop --quiet --oknodo -n $NAME
-        ;;
-    *)
-        echo "Usage: $0 {start|stop}"
-    exit 1
-esac
-exit 0
+if [ "$1" == "stop" ]
+then 
+    start-stop-daemon -K /usr/bin/aesdsocket
+fi

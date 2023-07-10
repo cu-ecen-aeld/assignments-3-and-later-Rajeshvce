@@ -1,19 +1,11 @@
-.PHONY: all default clean valgrind
+CC?=${CROSS_COMPILE}gcc
+CFLAGS?=-Wall -Werror
+TARGET?=aesdsocket
+LDFLAGS?= -pthread -lrt
 
-SRC := aesdsocket.c
-TARGET ?= aesdsocket
-CC ?= ${CROSS_COMPILE}gcc
-CFLAGS ?= -g -Wall -Werror -std=gnu99
-LDFLAGS ?= -lpthread
-all: default
-
-default: aesdsocket
-
-aesdsocket: aesdsocket.c
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
-
+default:
+	 ${CC} ${CFLAGS} ${LDFLAGS} -o ${TARGET} ${TARGET}.c
+all:
+	${CC} ${CFLAGS} ${LDFLAGS} -o ${TARGET} ${TARGET}.c
 clean:
-	-rm -f $(TARGET)
-
-valgrind: aesdsocket
-	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --verbose --log-file=/tmp/valgrind-aesdsocket.txt ./aesdsocket
+	rm -rf aesdsocket
